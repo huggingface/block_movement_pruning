@@ -26,6 +26,13 @@ import torch
 from emmental.modules import MagnitudeBinarizer, ThresholdBinarizer, TopKBinarizer
 
 
+def expand_mask(mask, args):
+    mask_block_rows = args.mask_block_rows
+    mask_block_cols = args.mask_block_cols
+    mask = torch.repeat_interleave(mask, mask_block_rows, dim=0)
+    mask = torch.repeat_interleave(mask, mask_block_cols, dim=1)
+    return mask
+
 def main(args):
     pruning_method = args.pruning_method
     threshold = args.threshold
@@ -58,6 +65,7 @@ def main(args):
                 prefix_ = name[:-6]
                 scores = model[f"{prefix_}mask_scores"]
                 mask = TopKBinarizer.apply(scores, threshold)
+                mask = expand_mask(mask, args)
                 pruned_model[name] = tensor * mask
                 print(f"Pruned layer {name}")
             elif pruning_method == "sigmoied_threshold":
@@ -66,6 +74,7 @@ def main(args):
                 prefix_ = name[:-6]
                 scores = model[f"{prefix_}mask_scores"]
                 mask = ThresholdBinarizer.apply(scores, threshold, True)
+                mask = expand_mask(mask, args)
                 pruned_model[name] = tensor * mask
                 print(f"Pruned layer {name}")
             elif pruning_method == "l0":
@@ -77,6 +86,7 @@ def main(args):
                 s = torch.sigmoid(scores)
                 s_bar = s * (r - l) + l
                 mask = s_bar.clamp(min=0.0, max=1.0)
+                mask = expand_mask(mask, args)
                 pruned_model[name] = tensor * mask
                 print(f"Pruned layer {name}")
             else:
@@ -125,6 +135,19 @@ if __name__ == "__main__":
         type=str,
         required=False,
         help="Folder containing the model that was previously fine-pruned",
+    )
+    parser.add_argument(
+        "--mask_block_rows",
+        default=1,
+        type=int,
+        help="Block row size for masks. Default is 1 -> general sparsity, not block sparsity.",
+    )
+
+    parser.add_argument(
+        "--mask_block_cols",
+        default=1,
+        type=int,
+        help="Block row size for masks. Default is 1 -> general sparsity, not block sparsity.",
     )
 
     args = parser.parse_args()

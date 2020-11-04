@@ -22,13 +22,20 @@ import torch
 
 from emmental.modules import ThresholdBinarizer, TopKBinarizer
 
+def expand_mask(mask, args):
+    mask_block_rows = args.mask_block_rows
+    mask_block_cols = args.mask_block_cols
+    mask = torch.repeat_interleave(mask, mask_block_rows, dim=0)
+    mask = torch.repeat_interleave(mask, mask_block_cols, dim=1)
+    return mask
+
 
 def main(args):
     serialization_dir = args.serialization_dir
     pruning_method = args.pruning_method
     threshold = args.threshold
 
-    st = torch.load(os.path.join(serialization_dir, "pytorch_model.bin"), map_location="cpu")
+    st = torch.load(os.path.join(serialization_dir, "pytorch_model.bin"), map_location="cuda")
 
     remaining_count = 0  # Number of remaining (not pruned) params in the encoder
     encoder_count = 0  # Number of params in the encoder
@@ -39,23 +46,27 @@ def main(args):
             continue
 
         if "mask_scores" in name:
+            #print("mask_scores", name)
             if pruning_method == "topK":
-                mask_ones = TopKBinarizer.apply(param, threshold).sum().item()
+                mask_ones = TopKBinarizer.apply(param, threshold)
             elif pruning_method == "sigmoied_threshold":
-                mask_ones = ThresholdBinarizer.apply(param, threshold, True).sum().item()
+                mask_ones = ThresholdBinarizer.apply(param, threshold, True)
             elif pruning_method == "l0":
                 l, r = -0.1, 1.1
                 s = torch.sigmoid(param)
                 s_bar = s * (r - l) + l
                 mask = s_bar.clamp(min=0.0, max=1.0)
-                mask_ones = (mask > 0.0).sum().item()
+                mask_ones = (mask > 0.0)
             else:
                 raise ValueError("Unknown pruning method")
+            mask_ones = expand_mask(mask_ones, args).sum().item()
             remaining_count += mask_ones
             print(name.ljust(60, " "), str(round(100 * mask_ones / param.numel(), 3)).ljust(20, " "), str(mask_ones))
         else:
             encoder_count += param.numel()
-            if "bias" in name or "LayerNorm" in name:
+            if name.endswith(".weight") and ".".join(name.split(".")[:-1] + ["mask_scores"]) in st:
+                pass
+            else:
                 remaining_count += param.numel()
 
     print("")
@@ -86,7 +97,19 @@ if __name__ == "__main__":
         required=True,
         help="Folder containing the model that was previously fine-pruned",
     )
+    parser.add_argument(
+        "--mask_block_rows",
+        default=1,
+        type=int,
+        help="Block row size for masks. Default is 1 -> general sparsity, not block sparsity.",
+    )
 
+    parser.add_argument(
+        "--mask_block_cols",
+        default=1,
+        type=int,
+        help="Block row size for masks. Default is 1 -> general sparsity, not block sparsity.",
+    )
     args = parser.parse_args()
 
     main(args)
