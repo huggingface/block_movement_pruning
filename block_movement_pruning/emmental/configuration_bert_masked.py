@@ -52,6 +52,9 @@ class MaskedBertConfig(PretrainedConfig):
         mask_scale=0.0,
         mask_block_rows=1,
         mask_block_cols=1,
+        ampere_pruning_method: str = None,
+        ampere_mask_init: str = "constant",
+        ampere_mask_scale: float = 0.0,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -73,3 +76,6 @@ class MaskedBertConfig(PretrainedConfig):
         self.mask_scale = mask_scale
         self.mask_block_rows = mask_block_rows
         self.mask_block_cols = mask_block_cols
+        self.ampere_pruning_method = ampere_pruning_method
+        self.ampere_mask_init = ampere_mask_init
+        self.ampere_mask_scale = ampere_mask_scale

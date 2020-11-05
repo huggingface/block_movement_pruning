@@ -20,6 +20,7 @@ The pruned weight matrix is then multiplied against the inputs (and if necessary
 """
 
 import math
+from itertools import permutations
 
 import torch
 from torch import nn
@@ -45,6 +46,9 @@ class MaskedLinear(nn.Linear):
         pruning_method: str = "topK",
         mask_block_rows:int = 1,
         mask_block_cols:int = 1,
+        ampere_pruning_method: str = "disabled",
+        ampere_mask_init: str = "constant",
+        ampere_mask_scale: float = 0.0,
     ):
         """
         Args:
@@ -72,6 +76,8 @@ class MaskedLinear(nn.Linear):
         self.pruning_method = pruning_method
         self.mask_block_rows = mask_block_rows
         self.mask_block_cols = mask_block_cols
+        assert ampere_pruning_method in ["disabled", "annealing"]
+        self.ampere_pruning_method = ampere_pruning_method
 
         if self.pruning_method in ["topK", "threshold", "sigmoied_threshold", "l0"]:
             self.mask_scale = mask_scale
@@ -82,6 +88,52 @@ class MaskedLinear(nn.Linear):
             mask_size = (size[0] // self.mask_block_rows, size[1] // self.mask_block_cols)
             self.mask_scores = nn.Parameter(torch.Tensor(size=mask_size))
             self.init_mask()
+
+        if self.ampere_pruning_method == "annealing":
+            self.ampere_mask_init = ampere_mask_init
+            self.ampere_mask_scale = ampere_mask_scale
+            self.initialize_ampere_weights()
+
+    def ampere_pattern(self, device = None):
+        if self.sparse_patterns is not None:
+            if device is not None:
+                if self.sparse_patterns.device != device:
+                    self.sparse_patterns = self.sparse_patterns.to(device=device)
+            return self.sparse_patterns
+        patterns = torch.zeros(self.M)
+        patterns[:self.N] = 1
+        self.sparse_patterns = torch.Tensor(list(set(permutations(patterns.tolist()))))
+        return self.sparse_patterns
+
+    M = 4
+    N = 2
+
+    def initialize_ampere_weights(self):
+        """"We must remember that weights are used in transposed form for forward pass,
+        which we want to optimize the most.
+        So we make sure we are creating an Ampere sparse pattern on the right dimension -> 0"""
+        assert ((self.weight.shape[0] % self.M) == 0)
+        self.sparse_patterns = None
+
+        sparse_patterns_count = self.ampere_pattern(None).shape[0]
+        # Creating the pattern in a transposed way to avoid a few ops later
+        ampere_mask_size = (self.weight.shape[1], self.weight.shape[0] // self.M, sparse_patterns_count)
+        self.ampere_weights = nn.Parameter(torch.Tensor(size=ampere_mask_size))
+
+        if self.ampere_mask_init == "constant":
+            init.constant_(self.ampere_weights, val=self.ampere_mask_scale)
+        elif self.ampere_mask_init == "uniform":
+            init.uniform_(self.ampere_weights, a=-self.ampere_mask_scale, b=self.ampere_mask_scale)
+        elif self.ampere_mask_init == "kaiming":
+            init.kaiming_uniform_(self.ampere_weights, a=math.sqrt(5))
+
+    def ampere_mask(self, temperature:float, device):
+        s = torch.nn.functional.softmax(self.ampere_weights * temperature, dim=-1)
+        s = s.matmul(self.ampere_pattern(device))
+        s = s.view(-1, s.shape[1] * s.shape[2])
+        s = s.t()
+
+        return s
 
     def init_mask(self):
         if self.mask_init == "constant":
@@ -96,8 +148,10 @@ class MaskedLinear(nn.Linear):
         mask = torch.repeat_interleave(mask, self.mask_block_cols, dim=1)
         return mask
 
-    def forward(self, input: torch.tensor, threshold: float):
+    def forward(self, input: torch.tensor, current_config: dict):
         # Get the mask
+        threshold = current_config["threshold"]
+        ampere_temperature = current_config["ampere_temperature"]
         if self.pruning_method == "topK":
             mask = TopKBinarizer.apply(self.mask_scores, threshold)
         elif self.pruning_method in ["threshold", "sigmoied_threshold"]:
@@ -115,7 +169,13 @@ class MaskedLinear(nn.Linear):
             s_bar = s * (r - l) + l
             mask = s_bar.clamp(min=0.0, max=1.0)
         # Expand block mask to individual element mask
-        mask = self.expand_mask(mask)
+        if self.pruning_method != "magnitude":
+            mask = self.expand_mask(mask)
+
+        if self.ampere_pruning_method != "disabled":
+            ampere_mask = self.ampere_mask(ampere_temperature, device=mask.device)
+            mask = mask * ampere_mask
+
         # Mask weights with computed mask
         weight_thresholded = mask * self.weight
         # Compute output (linear layer) with masked weights

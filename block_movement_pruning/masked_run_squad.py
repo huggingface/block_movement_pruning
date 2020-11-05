@@ -83,18 +83,23 @@ def schedule_threshold(
     initial_warmup: int,
     final_warmup: int,
     final_lambda: float,
+    initial_ampere_temperature:float,
+    final_ampere_temperature:float,
 ):
     if step <= initial_warmup * warmup_steps:
         threshold = initial_threshold
+        ampere_temperature = initial_ampere_temperature
     elif step > (total_step - final_warmup * warmup_steps):
         threshold = final_threshold
+        ampere_temperature = final_ampere_temperature
     else:
         spars_warmup_steps = initial_warmup * warmup_steps
         spars_schedu_steps = (final_warmup + initial_warmup) * warmup_steps
         mul_coeff = 1 - (step - spars_warmup_steps) / (total_step - spars_schedu_steps)
         threshold = final_threshold + (initial_threshold - final_threshold) * (mul_coeff ** 3)
+        ampere_temperature = final_ampere_temperature + (initial_ampere_temperature - final_ampere_temperature) * (mul_coeff ** 3)
     regu_lambda = final_lambda * threshold / final_threshold
-    return threshold, regu_lambda
+    return threshold, regu_lambda, ampere_temperature
 
 
 def regularization(model: nn.Module, mode: str):
@@ -248,7 +253,7 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
 
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            threshold, regu_lambda = schedule_threshold(
+            threshold, regu_lambda, ampere_temperature = schedule_threshold(
                 step=global_step,
                 total_step=t_total,
                 warmup_steps=args.warmup_steps,
@@ -257,6 +262,8 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 final_warmup=args.final_warmup,
                 initial_warmup=args.initial_warmup,
                 final_lambda=args.final_lambda,
+                initial_ampere_temperature=args.initial_ampere_temperature,
+                final_ampere_temperature=args.final_ampere_temperature,
             )
             # Global TopK
             if args.global_topk:
@@ -295,7 +302,8 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                     )
 
             if "masked" in args.model_type:
-                inputs["threshold"] = threshold
+                current_config = dict(threshold = threshold, ampere_temperature=ampere_temperature)
+                inputs["current_config"] = current_config
 
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
@@ -803,6 +811,14 @@ def create_parser():
     parser.add_argument(
         "--final_threshold", default=0.7, type=float, help="Final value of the threshold (for scheduling)."
     )
+
+    parser.add_argument(
+        "--initial_ampere_temperature", default=0.0, type=float, help="Initial value of the ampere temperature (for scheduling)."
+    )
+    parser.add_argument(
+        "--final_ampere_temperature", default=20, type=float, help="Final value of the ampere temperature (for scheduling)."
+    )
+
     parser.add_argument(
         "--initial_warmup",
         default=1,
@@ -847,6 +863,25 @@ def create_parser():
         help="Block row size for masks. Default is 1 -> general sparsity, not block sparsity.",
     )
 
+    parser.add_argument(
+        "--ampere_pruning_method",
+        default="disabled",
+        type=str,
+        help="Pruning Method (annealing: softmaxing mask values with temperature).",
+    )
+
+    parser.add_argument(
+        "--ampere_mask_init",
+        default="constant",
+        type=str,
+        help="Initialization method for the ampere mask scores"
+    )
+
+    parser.add_argument(
+        "--ampere_mask_scale", default=0.0, type=float,
+        help="Initialization parameter for the chosen ampere mask initialization method."
+    )
+
     parser.add_argument("--regularization", default=None, help="Add L0 or L1 regularization to the mask scores.")
     parser.add_argument(
         "--final_lambda",
@@ -854,6 +889,8 @@ def create_parser():
         type=float,
         help="Regularization intensity (used in conjunction with `regularization`.",
     )
+
+
 
     parser.add_argument("--global_topk", action="store_true", help="Global TopK on the Scores.")
     parser.add_argument(
@@ -1045,6 +1082,11 @@ class ShortNamer(TrialShortNamer):
         version_2_with_negative=False,
         warmup_steps=5400,
         weight_decay=0.0,
+        ampere_mask_init='constant',
+        ampere_mask_scale=0.0,
+        ampere_pruning_method='disabled',
+        initial_ampere_temperature=0.0,
+        final_ampere_temperature=20,
     )
 
 
@@ -1129,6 +1171,9 @@ def main_single(args):
         mask_scale=args.mask_scale,
         mask_block_rows=args.mask_block_rows,
         mask_block_cols=args.mask_block_cols,
+        ampere_pruning_method=args.ampere_pruning_method,
+        ampere_mask_init=args.ampere_mask_init,
+        ampere_mask_scale=args.ampere_mask_scale,
     )
     tokenizer = tokenizer_class.from_pretrained(
         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
@@ -1246,16 +1291,17 @@ def main():
         args.regularization = None
 
     sizes = [(2, 1), (8, 1), (32, 1), (128, 1), (4, 4), (8, 8), (32, 32), (1, 2), (1, 8), (1, 32), (1, 128)][::]
+    sizes = [(1,1)]
 
     for size in sizes:
         single_args = copy.deepcopy(args)
         single_args.mask_block_rows = size[0]
         single_args.mask_block_cols = size[1]
 
-        try:
-            main_single(single_args)
-        except Exception as e:
-            print(e)
+        #try:
+        main_single(single_args)
+        #except Exception as e:
+        #    print(e)
 
 
 if __name__ == "__main__":

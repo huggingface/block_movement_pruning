@@ -25,18 +25,31 @@ import math
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
-
-from emmental import MaskedBertConfig
-from emmental.modules import MaskedLinear
 from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from transformers.modeling_bert import ACT2FN, load_tf_weights_in_bert
 from transformers.modeling_utils import PreTrainedModel, prune_linear_layer
 
+from emmental import MaskedBertConfig
+from emmental.modules import MaskedLinear
 
 BertLayerNorm = torch.nn.LayerNorm
 
 logger = logging.getLogger(__name__)
 
+
+def create_masked_linear(in_features, out_features, config, bias=True):
+    ret = MaskedLinear(in_features=in_features,
+                       out_features=out_features,
+                       pruning_method=config.pruning_method,
+                       mask_init=config.mask_init,
+                       mask_scale=config.mask_scale,
+                       mask_block_rows=config.mask_block_rows,
+                       mask_block_cols=config.mask_block_cols,
+                       ampere_pruning_method=config.ampere_pruning_method,
+                       ampere_mask_init=config.ampere_mask_init,
+                       ampere_mask_scale=config.ampere_mask_scale,
+                       )
+    return ret
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
@@ -91,33 +104,9 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
-        self.key = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
-        self.value = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
+        self.query = create_masked_linear(config.hidden_size, self.all_head_size, config)
+        self.key = create_masked_linear(config.hidden_size, self.all_head_size, config)
+        self.value = create_masked_linear(config.hidden_size, self.all_head_size, config)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -133,20 +122,20 @@ class BertSelfAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        threshold=None,
+        current_config=None,
     ):
-        mixed_query_layer = self.query(hidden_states, threshold=threshold)
+        mixed_query_layer = self.query(hidden_states, current_config=current_config)
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
         # such that the encoder's padding tokens are not attended to.
         if encoder_hidden_states is not None:
-            mixed_key_layer = self.key(encoder_hidden_states, threshold=threshold)
-            mixed_value_layer = self.value(encoder_hidden_states, threshold=threshold)
+            mixed_key_layer = self.key(encoder_hidden_states, current_config=current_config)
+            mixed_value_layer = self.value(encoder_hidden_states, current_config=current_config)
             attention_mask = encoder_attention_mask
         else:
-            mixed_key_layer = self.key(hidden_states, threshold=threshold)
-            mixed_value_layer = self.value(hidden_states, threshold=threshold)
+            mixed_key_layer = self.key(hidden_states, current_config=current_config)
+            mixed_value_layer = self.value(hidden_states, current_config=current_config)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -183,20 +172,12 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = MaskedLinear(
-            config.hidden_size,
-            config.hidden_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
+        self.dense = create_masked_linear(config.hidden_size, config.hidden_size, config)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor, threshold):
-        hidden_states = self.dense(hidden_states, threshold=threshold)
+    def forward(self, hidden_states, input_tensor, current_config):
+        hidden_states = self.dense(hidden_states, current_config=current_config)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -239,7 +220,7 @@ class BertAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        threshold=None,
+        current_config=None,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -247,9 +228,9 @@ class BertAttention(nn.Module):
             head_mask,
             encoder_hidden_states,
             encoder_attention_mask,
-            threshold=threshold,
+            current_config=current_config,
         )
-        attention_output = self.output(self_outputs[0], hidden_states, threshold=threshold)
+        attention_output = self.output(self_outputs[0], hidden_states, current_config=current_config)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
@@ -257,22 +238,14 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = MaskedLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
+        self.dense = create_masked_linear(config.hidden_size, config.intermediate_size, config)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
-    def forward(self, hidden_states, threshold):
-        hidden_states = self.dense(hidden_states, threshold=threshold)
+    def forward(self, hidden_states, current_config):
+        hidden_states = self.dense(hidden_states, current_config=current_config)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -280,20 +253,13 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = MaskedLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-            mask_block_rows=config.mask_block_rows,
-            mask_block_cols=config.mask_block_cols,
-        )
+        self.dense = create_masked_linear(config.intermediate_size, config.hidden_size, config)
+
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor, threshold):
-        hidden_states = self.dense(hidden_states, threshold=threshold)
+    def forward(self, hidden_states, input_tensor, current_config):
+        hidden_states = self.dense(hidden_states, current_config=current_config)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -316,9 +282,9 @@ class BertLayer(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        threshold=None,
+        current_config=None,
     ):
-        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask, threshold=threshold)
+        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask, current_config=current_config)
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
@@ -329,8 +295,8 @@ class BertLayer(nn.Module):
             attention_output = cross_attention_outputs[0]
             outputs = outputs + cross_attention_outputs[1:]  # add cross attentions if we output attention weights
 
-        intermediate_output = self.intermediate(attention_output, threshold=threshold)
-        layer_output = self.output(intermediate_output, attention_output, threshold=threshold)
+        intermediate_output = self.intermediate(attention_output, current_config=current_config)
+        layer_output = self.output(intermediate_output, attention_output, current_config=current_config)
         outputs = (layer_output,) + outputs
         return outputs
 
@@ -349,7 +315,7 @@ class BertEncoder(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        threshold=None,
+        current_config=None,
     ):
         all_hidden_states = ()
         all_attentions = ()
@@ -363,7 +329,7 @@ class BertEncoder(nn.Module):
                 head_mask[i],
                 encoder_hidden_states,
                 encoder_attention_mask,
-                threshold=threshold,
+                current_config=current_config,
             )
             hidden_states = layer_outputs[0]
 
@@ -523,11 +489,11 @@ class MaskedBertModel(MaskedBertPreTrainedModel):
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        threshold=None,
+        current_config=None,
     ):
         r"""
-        threshold (:obj:`float`):
-            Threshold value (see :class:`~emmental.MaskedLinear`).
+        current_config dict
+            current_config dict (see :class:`emmental.MaskedLinear`).
 
         Return:
             :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~emmental.MaskedBertConfig`) and inputs:
@@ -658,7 +624,7 @@ class MaskedBertModel(MaskedBertPreTrainedModel):
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
-            threshold=threshold,
+            current_config=current_config,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output)
@@ -695,7 +661,7 @@ class MaskedBertForSequenceClassification(MaskedBertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        threshold=None,
+        current_config=None,
     ):
         r"""
             labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -703,8 +669,8 @@ class MaskedBertForSequenceClassification(MaskedBertPreTrainedModel):
                 Indices should be in :obj:`[0, ..., config.num_labels - 1]`.
                 If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
                 If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-            threshold (:obj:`float`):
-                Threshold value (see :class:`~emmental.MaskedLinear`).
+            current_config dict
+                current_config dict (see :class:`emmental.MaskedLinear`).
 
         Returns:
             :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~emmental.MaskedBertConfig`) and inputs:
@@ -732,7 +698,7 @@ class MaskedBertForSequenceClassification(MaskedBertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            threshold=threshold,
+            current_config=current_config,
         )
 
         pooled_output = outputs[1]
@@ -780,15 +746,15 @@ class MaskedBertForMultipleChoice(MaskedBertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        threshold=None,
+        current_config=None,
     ):
         r"""
             labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
                 Labels for computing the multiple choice classification loss.
                 Indices should be in ``[0, ..., num_choices]`` where `num_choices` is the size of the second dimension
                 of the input tensors. (see `input_ids` above)
-            threshold (:obj:`float`):
-                Threshold value (see :class:`~emmental.MaskedLinear`).
+            current_config dict
+                current_config dict (see :class:`emmental.MaskedLinear`).
 
         Returns:
             :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~emmental.MaskedBertConfig`) and inputs:
@@ -825,7 +791,7 @@ class MaskedBertForMultipleChoice(MaskedBertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            threshold=threshold,
+            current_config=current_config,
         )
 
         pooled_output = outputs[1]
@@ -870,14 +836,14 @@ class MaskedBertForTokenClassification(MaskedBertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        threshold=None,
+        current_config=None,
     ):
         r"""
             labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
                 Labels for computing the token classification loss.
                 Indices should be in ``[0, ..., config.num_labels - 1]``.
-            threshold (:obj:`float`):
-                Threshold value (see :class:`~emmental.MaskedLinear`).
+            current_config dict
+                current_config dict (see :class:`emmental.MaskedLinear`).
 
         Returns:
             :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~emmental.MaskedBertConfig`) and inputs:
@@ -905,7 +871,7 @@ class MaskedBertForTokenClassification(MaskedBertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            threshold=threshold,
+            current_config=current_config,
         )
 
         sequence_output = outputs[0]
@@ -957,7 +923,7 @@ class MaskedBertForQuestionAnswering(MaskedBertPreTrainedModel):
         inputs_embeds=None,
         start_positions=None,
         end_positions=None,
-        threshold=None,
+        current_config=None,
     ):
         r"""
             start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -968,8 +934,8 @@ class MaskedBertForQuestionAnswering(MaskedBertPreTrainedModel):
                 Labels for position (index) of the end of the labelled span for computing the token classification loss.
                 Positions are clamped to the length of the sequence (`sequence_length`).
                 Position outside of the sequence are not taken into account for computing the loss.
-            threshold (:obj:`float`):
-                Threshold value (see :class:`~emmental.MaskedLinear`).
+            current_config dict
+                current_config dict (see :class:`emmental.MaskedLinear`).
 
         Returns:
             :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~emmental.MaskedBertConfig`) and inputs:
@@ -999,7 +965,7 @@ class MaskedBertForQuestionAnswering(MaskedBertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            threshold=threshold,
+            current_config=current_config,
         )
 
         sequence_output = outputs[0]
