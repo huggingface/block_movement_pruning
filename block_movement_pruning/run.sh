@@ -6,8 +6,8 @@ python masked_run_squad.py --output_dir /content/block_movement_pruning/output -
                    --do_lower_case \
                    --model_type masked_bert \
                    --model_name_or_path bert-base-uncased \
-                   --per_gpu_train_batch_size 1 \
-                   --gradient_accumulation_steps 16 \
+                   --per_gpu_train_batch_size 16 \
+                   --gradient_accumulation_steps 1 \
                    --num_train_epochs 10 \
                    --learning_rate 3e-5 \
                    --initial_threshold 1 \
