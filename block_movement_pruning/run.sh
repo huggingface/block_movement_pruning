@@ -1,4 +1,4 @@
-python masked_run_squad.py --output_dir block_movement_pruning/output --overwrite_output_dir \
+python masked_run_squad.py --output_dir /content/block_movement_pruning/output --overwrite_output_dir \
                    --data_dir squad_data \
                    --train_file train-v1.1.json --predict_file dev-v1.1.json \
                    --do_train --do_eval \
