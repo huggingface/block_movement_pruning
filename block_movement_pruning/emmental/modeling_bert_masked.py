@@ -48,6 +48,9 @@ def create_masked_linear(in_features, out_features, config, bias=True):
                        ampere_pruning_method=config.ampere_pruning_method,
                        ampere_mask_init=config.ampere_mask_init,
                        ampere_mask_scale=config.ampere_mask_scale,
+                       shuffling_method = config.shuffling_method,
+                       in_shuffling_group = config.in_shuffling_group,
+                       out_shuffling_group = config.out_shuffling_group,
                        )
     return ret
 

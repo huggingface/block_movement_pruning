@@ -85,21 +85,27 @@ def schedule_threshold(
     final_lambda: float,
     initial_ampere_temperature:float,
     final_ampere_temperature:float,
+    initial_shuffling_temperature: float,
+    final_shuffling_temperature: float,
 ):
     if step <= initial_warmup * warmup_steps:
         threshold = initial_threshold
         ampere_temperature = initial_ampere_temperature
+        shuffling_temperature = initial_shuffling_temperature
     elif step > (total_step - final_warmup * warmup_steps):
         threshold = final_threshold
         ampere_temperature = final_ampere_temperature
+        shuffling_temperature = final_shuffling_temperature
     else:
         spars_warmup_steps = initial_warmup * warmup_steps
         spars_schedu_steps = (final_warmup + initial_warmup) * warmup_steps
         mul_coeff = 1 - (step - spars_warmup_steps) / (total_step - spars_schedu_steps)
         threshold = final_threshold + (initial_threshold - final_threshold) * (mul_coeff ** 3)
         ampere_temperature = final_ampere_temperature + (initial_ampere_temperature - final_ampere_temperature) * (mul_coeff ** 3)
+        shuffling_temperature = final_shuffling_temperature + (initial_shuffling_temperature - final_shuffling_temperature) * (mul_coeff ** 3)
+
     regu_lambda = final_lambda * threshold / final_threshold
-    return threshold, regu_lambda, ampere_temperature
+    return threshold, regu_lambda, ampere_temperature, shuffling_temperature
 
 
 def regularization(model: nn.Module, mode: str):
@@ -137,16 +143,25 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
+
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if "mask_score" in n and p.requires_grad],
             "lr": args.mask_scores_learning_rate,
         },
         {
+            "params": [p for n, p in model.named_parameters() if "ampere_permut_scores" in n and p.requires_grad],
+            "lr": args.ampere_learning_rate,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "permutation_scores" in n and p.requires_grad],
+            "lr": args.shuffling_learning_rate,
+        },
+        {
             "params": [
                 p
                 for n, p in model.named_parameters()
-                if "mask_score" not in n and p.requires_grad and not any(nd in n for nd in no_decay)
+                if "mask_score" not in n and "ampere_permut_scores" not in n and "permutation_scores" not in n and p.requires_grad and not any(nd in n for nd in no_decay)
             ],
             "lr": args.learning_rate,
             "weight_decay": args.weight_decay,
@@ -155,7 +170,7 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
             "params": [
                 p
                 for n, p in model.named_parameters()
-                if "mask_score" not in n and p.requires_grad and any(nd in n for nd in no_decay)
+                if "mask_score" not in n and "ampere_permut_scores" not in n and "permutation_scores" not in n and p.requires_grad and any(nd in n for nd in no_decay)
             ],
             "lr": args.learning_rate,
             "weight_decay": 0.0,
@@ -253,7 +268,7 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
 
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            threshold, regu_lambda, ampere_temperature = schedule_threshold(
+            threshold, regu_lambda, ampere_temperature, shuffling_temperature = schedule_threshold(
                 step=global_step,
                 total_step=t_total,
                 warmup_steps=args.warmup_steps,
@@ -264,6 +279,8 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 final_lambda=args.final_lambda,
                 initial_ampere_temperature=args.initial_ampere_temperature,
                 final_ampere_temperature=args.final_ampere_temperature,
+                initial_shuffling_temperature=args.initial_shuffling_temperature,
+                final_shuffling_temperature=args.final_shuffling_temperature,
             )
             # Global TopK
             if args.global_topk:
@@ -302,7 +319,9 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                     )
 
             if "masked" in args.model_type:
-                current_config = dict(threshold = threshold, ampere_temperature=ampere_temperature)
+                current_config = dict(threshold = threshold,
+                                      ampere_temperature=ampere_temperature,
+                                      shuffling_temperature=shuffling_temperature)
                 inputs["current_config"] = current_config
 
             outputs = model(**inputs)
@@ -364,22 +383,26 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     tb_writer.add_scalar("threshold", threshold, global_step)
                     for name, param in model.named_parameters():
-                        if not param.requires_grad:
-                            continue
-                        tb_writer.add_scalar("parameter_mean/" + name, param.data.mean(), global_step)
-                        tb_writer.add_scalar("parameter_std/" + name, param.data.std(), global_step)
-                        tb_writer.add_scalar("parameter_min/" + name, param.data.min(), global_step)
-                        tb_writer.add_scalar("parameter_max/" + name, param.data.max(), global_step)
-                        if "pooler" in name:
-                            continue
-                        tb_writer.add_scalar("grad_mean/" + name, param.grad.data.mean(), global_step)
-                        tb_writer.add_scalar("grad_std/" + name, param.grad.data.std(), global_step)
-                        if args.regularization is not None and "mask_scores" in name:
-                            if args.regularization == "l1":
-                                perc = (torch.sigmoid(param) > threshold).sum().item() / param.numel()
-                            elif args.regularization == "l0":
-                                perc = (torch.sigmoid(param - 2 / 3 * np.log(0.1 / 1.1))).sum().item() / param.numel()
-                            tb_writer.add_scalar("retained_weights_perc/" + name, perc, global_step)
+                        try:
+                            if not param.requires_grad:
+                                continue
+                            tb_writer.add_scalar("parameter_mean/" + name, param.data.mean(), global_step)
+                            tb_writer.add_scalar("parameter_std/" + name, param.data.std(), global_step)
+                            tb_writer.add_scalar("parameter_min/" + name, param.data.min(), global_step)
+                            tb_writer.add_scalar("parameter_max/" + name, param.data.max(), global_step)
+                            if "pooler" in name:
+                                continue
+                            tb_writer.add_scalar("grad_mean/" + name, param.grad.data.mean(), global_step)
+                            tb_writer.add_scalar("grad_std/" + name, param.grad.data.std(), global_step)
+                            if args.regularization is not None and "mask_scores" in name:
+                                if args.regularization == "l1":
+                                    perc = (torch.sigmoid(param) > threshold).sum().item() / param.numel()
+                                elif args.regularization == "l0":
+                                    perc = (torch.sigmoid(param - 2 / 3 * np.log(0.1 / 1.1))).sum().item() / param.numel()
+                                tb_writer.add_scalar("retained_weights_perc/" + name, perc, global_step)
+                        except AttributeError as e:
+                            print(f"name error with {name}", e)
+
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
@@ -511,7 +534,10 @@ def evaluate(args, model, tokenizer, prefix=""):
                         {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
                     )
             if "masked" in args.model_type:
-                inputs["threshold"] = args.final_threshold
+                inputs["current_config"] = {}
+                inputs["current_config"]["threshold"] = args.final_threshold
+                inputs["current_config"]["ampere_temperature"] = args.final_ampere_temperature
+                inputs["current_config"]["shuffling_temperature"] = args.final_shuffling_temperature
                 if args.global_topk:
                     if threshold_mem is None:
                         concat = torch.cat(
@@ -520,7 +546,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                         n = concat.numel()
                         kth = max(n - (int(n * args.final_threshold) + 1), 1)
                         threshold_mem = concat.kthvalue(kth).values.item()
-                    inputs["threshold"] = threshold_mem
+                    inputs["current_config"]["threshold"] = threshold_mem
             outputs = model(**inputs)
 
         for i, example_index in enumerate(example_indices):
@@ -805,6 +831,22 @@ def create_parser():
         type=float,
         help="The Adam initial learning rate of the mask scores.",
     )
+
+    # Pruning parameters
+    parser.add_argument(
+        "--ampere_learning_rate",
+        default=1e-2,
+        type=float,
+        help="The Adam initial learning rate of the mask scores.",
+    )
+    # Pruning parameters
+    parser.add_argument(
+        "--shuffling_learning_rate",
+        default=1e-3,
+        type=float,
+        help="The Adam initial learning rate of the mask scores.",
+    )
+
     parser.add_argument(
         "--initial_threshold", default=1.0, type=float, help="Initial value of the threshold (for scheduling)."
     )
@@ -818,6 +860,14 @@ def create_parser():
     parser.add_argument(
         "--final_ampere_temperature", default=20, type=float, help="Final value of the ampere temperature (for scheduling)."
     )
+
+    parser.add_argument(
+        "--initial_shuffling_temperature", default=0.1, type=float, help="Initial value of the shuffling temperature (for scheduling)."
+    )
+    parser.add_argument(
+        "--final_shuffling_temperature", default=20, type=float, help="Final value of the shuffling temperature (for scheduling)."
+    )
+
 
     parser.add_argument(
         "--initial_warmup",
@@ -880,6 +930,26 @@ def create_parser():
     parser.add_argument(
         "--ampere_mask_scale", default=0.0, type=float,
         help="Initialization parameter for the chosen ampere mask initialization method."
+    )
+
+    parser.add_argument(
+        "--shuffling_method",
+        default="disabled",
+        type=str,
+        help="Shuffling Method (annealing: softmaxing permutation scores with temperature).",
+    )
+
+    parser.add_argument(
+        "--in_shuffling_group",
+        default="4",
+        type=int,
+        help="Shuffling group size for matrix input (with shuffling_method == annealing).",
+    )
+    parser.add_argument(
+        "--out_shuffling_group",
+        default="4",
+        type=int,
+        help="Shuffling group size for matrix output (with shuffling_method == annealing).",
     )
 
     parser.add_argument("--regularization", default=None, help="Add L0 or L1 regularization to the mask scores.")
@@ -1046,6 +1116,8 @@ class ShortNamer(TrialShortNamer):
         mask_init="constant",
         mask_scale=0.0,
         mask_scores_learning_rate=0.01,
+        ampere_learning_rate=0.01,
+        shuffling_learning_rate=0.001,
         mask_block_rows=1,
         mask_block_cols=1,
         max_answer_length=30,
@@ -1087,12 +1159,17 @@ class ShortNamer(TrialShortNamer):
         ampere_pruning_method='disabled',
         initial_ampere_temperature=0.0,
         final_ampere_temperature=20,
+        shuffling_method="disabled",
+        in_shuffling_group=4,
+        out_shuffling_group=4,
+        initial_shuffling_temperature=0.1,
+        final_shuffling_temperature=20,
     )
 
 
 def main_single(args):
     short_name = ShortNamer.shortname(args.__dict__)
-
+    print(f"HP NAME {short_name}")
     args.output_dir = os.path.join(args.output_dir, short_name)
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -1174,7 +1251,11 @@ def main_single(args):
         ampere_pruning_method=args.ampere_pruning_method,
         ampere_mask_init=args.ampere_mask_init,
         ampere_mask_scale=args.ampere_mask_scale,
+        shuffling_method=args.shuffling_method,
+        in_shuffling_group=args.in_shuffling_group,
+        out_shuffling_group=args.out_shuffling_group,
     )
+
     tokenizer = tokenizer_class.from_pretrained(
         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
         do_lower_case=args.do_lower_case,
@@ -1291,7 +1372,7 @@ def main():
         args.regularization = None
 
     sizes = [(2, 1), (8, 1), (32, 1), (128, 1), (4, 4), (8, 8), (32, 32), (1, 2), (1, 8), (1, 32), (1, 128)][::]
-    sizes = [(1,1)]
+    sizes = [(32,32), (16,16), (64,64)]
 
     for size in sizes:
         single_args = copy.deepcopy(args)

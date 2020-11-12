@@ -20,7 +20,7 @@ import os
 
 import torch
 
-from emmental.modules import ThresholdBinarizer, TopKBinarizer
+from emmental.modules import MaskedLinear
 
 def expand_mask(mask, args):
     mask_block_rows = args.mask_block_rows
@@ -34,6 +34,7 @@ def main(args):
     serialization_dir = args.serialization_dir
     pruning_method = args.pruning_method
     threshold = args.threshold
+    ampere_pruning_method = args.ampere_pruning_method
 
     st = torch.load(os.path.join(serialization_dir, "pytorch_model.bin"), map_location="cuda")
 
@@ -45,23 +46,18 @@ def main(args):
         if "encoder" not in name:
             continue
 
-        if "mask_scores" in name:
-            #print("mask_scores", name)
-            if pruning_method == "topK":
-                mask_ones = TopKBinarizer.apply(param, threshold)
-            elif pruning_method == "sigmoied_threshold":
-                mask_ones = ThresholdBinarizer.apply(param, threshold, True)
-            elif pruning_method == "l0":
-                l, r = -0.1, 1.1
-                s = torch.sigmoid(param)
-                s_bar = s * (r - l) + l
-                mask = s_bar.clamp(min=0.0, max=1.0)
-                mask_ones = (mask > 0.0)
-            else:
-                raise ValueError("Unknown pruning method")
-            mask_ones = expand_mask(mask_ones, args).sum().item()
-            remaining_count += mask_ones
+        if name.endswith(".weight"):
+            weights = MaskedLinear.masked_weights_from_state_dict(st,
+                                                                  name,
+                                                                  pruning_method,
+                                                                  threshold,
+                                                                  ampere_pruning_method)
+            mask_ones = (weights != 0).sum().item()
             print(name.ljust(60, " "), str(round(100 * mask_ones / param.numel(), 3)).ljust(20, " "), str(mask_ones))
+
+            remaining_count += mask_ones
+        elif MaskedLinear.check_name(name):
+            pass
         else:
             encoder_count += param.numel()
             if name.endswith(".weight") and ".".join(name.split(".")[:-1] + ["mask_scores"]) in st:

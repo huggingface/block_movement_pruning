@@ -23,7 +23,7 @@ import shutil
 
 import torch
 
-from emmental.modules import MagnitudeBinarizer, ThresholdBinarizer, TopKBinarizer
+from emmental.modules import MaskedLinear
 
 
 def expand_mask(mask, args):
@@ -35,6 +35,7 @@ def expand_mask(mask, args):
 
 def main(args):
     pruning_method = args.pruning_method
+    ampere_pruning_method = args.ampere_pruning_method
     threshold = args.threshold
 
     model_name_or_path = args.model_name_or_path.rstrip("/")
@@ -55,42 +56,10 @@ def main(args):
             pruned_model[name] = tensor
             print(f"Copied layer {name}")
         else:
-            if pruning_method == "magnitude":
-                mask = MagnitudeBinarizer.apply(inputs=tensor, threshold=threshold)
-                pruned_model[name] = tensor * mask
-                print(f"Pruned layer {name}")
-            elif pruning_method == "topK":
-                if "mask_scores" in name:
-                    continue
-                prefix_ = name[:-6]
-                scores = model[f"{prefix_}mask_scores"]
-                mask = TopKBinarizer.apply(scores, threshold)
-                mask = expand_mask(mask, args)
-                pruned_model[name] = tensor * mask
-                print(f"Pruned layer {name}")
-            elif pruning_method == "sigmoied_threshold":
-                if "mask_scores" in name:
-                    continue
-                prefix_ = name[:-6]
-                scores = model[f"{prefix_}mask_scores"]
-                mask = ThresholdBinarizer.apply(scores, threshold, True)
-                mask = expand_mask(mask, args)
-                pruned_model[name] = tensor * mask
-                print(f"Pruned layer {name}")
-            elif pruning_method == "l0":
-                if "mask_scores" in name:
-                    continue
-                prefix_ = name[:-6]
-                scores = model[f"{prefix_}mask_scores"]
-                l, r = -0.1, 1.1
-                s = torch.sigmoid(scores)
-                s_bar = s * (r - l) + l
-                mask = s_bar.clamp(min=0.0, max=1.0)
-                mask = expand_mask(mask, args)
-                pruned_model[name] = tensor * mask
-                print(f"Pruned layer {name}")
+            if name.endswith(".weight"):
+                pruned_model[name] = MaskedLinear.masked_weights_from_state_dict(model, name, pruning_method, threshold, ampere_pruning_method)
             else:
-                raise ValueError("Unknown pruning method")
+                assert(MaskedLinear.check_name(name))
 
     if target_model_path is None:
         target_model_path = os.path.join(
